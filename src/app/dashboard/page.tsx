@@ -1,5 +1,7 @@
 import { normalizeFlightData } from 'next/dist/client/flight-data-helpers';
 import { cookies } from 'next/headers';
+import { loadRecommendedSongs, addRecommendedSong, isSongRecommended, isArtistBlacklisted, loadBlacklistedArtists } from '@/lib/songDatabase';
+import BlacklistButton from '@/components/BlacklistButton';
 
 export default async function dashboard() {
     // ============================================
@@ -123,8 +125,8 @@ export default async function dashboard() {
                     const artistName = similarArtist.name;
                     const artistLower = artistName.toLowerCase();
                     
-                    // Skip if we already have this artist in our library or already added them
-                    if (!userArtists.has(artistLower) && !uniqueArtists.has(artistLower)) {
+                    // Skip if we already have this artist in our library, already added them, or they're blacklisted
+                    if (!userArtists.has(artistLower) && !uniqueArtists.has(artistLower) && !isArtistBlacklisted(artistName)) {
                         uniqueArtists.add(artistLower);
                         similarArtists.push(artistName);
                         
@@ -140,6 +142,12 @@ export default async function dashboard() {
 
     console.log(`Found ${uniqueArtists.size} unique new artists`);
 
+    // Load existing recommended songs and blacklisted artists
+    const existingRecommendations = loadRecommendedSongs();
+    const blacklistedArtists = loadBlacklistedArtists();
+    console.log(`Database contains ${existingRecommendations.length} previously recommended songs`);
+    console.log(`Database contains ${blacklistedArtists.length} blacklisted artists`);
+
     // No need to shuffle since we're already getting exactly what we want
     const randomTenArtists = similarArtists.slice(0, targetArtists);
     
@@ -148,10 +156,16 @@ export default async function dashboard() {
     // ============================================
     // STEP 7: SEARCH FOR ARTISTS ON SPOTIFY AND GET THEIR TOP TRACKS
     // ============================================
-    // For each similar artist, find them on Spotify and get one of their top 3 tracks
+    // For each similar artist, find them on Spotify and get one of their top tracks
     const foundTracks = [];
+    const targetTrackCount = 10;
 
-    for (const artistName of randomTenArtists) {
+    // We might need more artists if some get skipped due to already recommended tracks
+    let artistIndex = 0;
+    
+    while (foundTracks.length < targetTrackCount && artistIndex < similarArtists.length) {
+        const artistName = similarArtists[artistIndex];
+        artistIndex++;
         try {
             // Search for the artist on Spotify
             const searchResponse = await fetch(`https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=1`, {
@@ -175,24 +189,53 @@ export default async function dashboard() {
                 const tracksData = await tracksResponse.json();
                 
                 if (tracksData.tracks && tracksData.tracks.length > 0) {
-                    // Pick randomly from their top 3 tracks for variety
-                    const randomIndex = Math.floor(Math.random() * Math.min(3, tracksData.tracks.length));
-                    const topTrack = tracksData.tracks[randomIndex]; // Random from top 3
+                    // Try to find a track we haven't recommended before
+                    let selectedTrack = null;
                     
-                    // Store the track info for display and playlist creation
-                    foundTracks.push({
-                        artist: artistName,
-                        name: topTrack.name,
-                        preview_url: topTrack.preview_url,
-                        external_urls: topTrack.external_urls.spotify,
-                        uri: topTrack.uri // Needed for adding to playlist
-                    });
+                    // First, try the top 5 tracks to find one we haven't recommended
+                    for (let i = 0; i < Math.min(5, tracksData.tracks.length); i++) {
+                        const track = tracksData.tracks[i];
+                        if (!isSongRecommended(track.uri)) {
+                            selectedTrack = track;
+                            break;
+                        }
+                    }
+                    
+                    // If we found a new track, use it
+                    if (selectedTrack) {
+                        // Store the track info for display and playlist creation
+                        const trackData = {
+                            artist: artistName,
+                            name: selectedTrack.name,
+                            preview_url: selectedTrack.preview_url,
+                            external_urls: selectedTrack.external_urls.spotify,
+                            uri: selectedTrack.uri // Needed for adding to playlist
+                        };
+                        
+                        foundTracks.push(trackData);
+                        
+                        // Add to our database so we don't recommend it again
+                        addRecommendedSong({
+                            uri: selectedTrack.uri,
+                            name: selectedTrack.name,
+                            artist: artistName,
+                            dateAdded: new Date().toISOString()
+                        });
+                        
+                        console.log(`Added new track: ${selectedTrack.name} by ${artistName}`);
+                    } else {
+                        console.log(`Skipping ${artistName} - all their top tracks already recommended`);
+                        // This artist's top tracks are all already recommended, skip them
+                        continue;
+                    }
                 }
             }
         } catch (error) {
             console.log(`Error searching for ${artistName}:`, error);
         }
     }
+    
+    console.log(`Final result: Found ${foundTracks.length} new tracks from ${artistIndex} artists checked`);
 
     // ============================================
     // STEP 8: CREATE SPOTIFY PLAYLIST WITH ALL FOUND TRACKS
@@ -218,7 +261,7 @@ export default async function dashboard() {
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
-                    name: `AI Recommendations ${new Date().toLocaleDateString()}`,
+                    name: `Discover NOW ${new Date().toLocaleDateString()} ${new Date().toLocaleTimeString()}`,
                     description: 'Generated playlist from similar artists',
                     public: false
                 })
@@ -279,8 +322,13 @@ export default async function dashboard() {
             <h1 className="text-2xl mb-4">Recommended Tracks</h1>
             {foundTracks.map((track, index) => (
                 <div key={index} className="mb-4 p-4 border rounded">
-                    <h3 className="font-bold">{track.name}</h3>
-                    <p className="text-gray-600">by {track.artist}</p>
+                    <div className="flex justify-between items-start mb-2">
+                        <div>
+                            <h3 className="font-bold">{track.name}</h3>
+                            <p className="text-gray-600">by {track.artist}</p>
+                        </div>
+                        <BlacklistButton artistName={track.artist} />
+                    </div>
                     <div className="mt-2">
                         {/* Audio preview if available */}
                         {track.preview_url && (
