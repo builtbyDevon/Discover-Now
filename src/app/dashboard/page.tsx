@@ -1,365 +1,153 @@
-import { normalizeFlightData } from 'next/dist/client/flight-data-helpers';
-import { cookies } from 'next/headers';
-import { loadRecommendedSongs, addRecommendedSong, isSongRecommended, isArtistBlacklisted, loadBlacklistedArtists } from '@/lib/songDatabase';
+'use client';
+import { useState, useEffect } from 'react';
 import BlacklistButton from '@/components/BlacklistButton';
 
-export default async function dashboard() {
-    // ============================================
-    // STEP 1: GET ACCESS TOKEN
-    // ============================================
-    const cookieStore = await cookies();
-    const accessToken = cookieStore.get('spotify_access_token')?.value;
-    const itemsPerRequest = 50;
-    const lastFmArtists = [];
+interface Track {
+    artist: string;
+    name: string;
+    preview_url: string;
+    external_urls: string;
+    uri: string;
+}
 
-    // ============================================
-    // STEP 2: GET TOTAL NUMBER OF USER'S SAVED TRACKS
-    // ============================================
-    // First, get the total number of tracks to know how many the user has
-    const initialResponse = await fetch(`https://api.spotify.com/v1/me/tracks?limit=1`, {
-        headers: {
-            'Authorization': `Bearer ${accessToken}`
-        }
-    });
-    const initialData = await initialResponse.json();
-    const totalTracks = initialData.total;
+export default function Dashboard() {
+    const [loading, setLoading] = useState(true);
+    const [tracks, setTracks] = useState<Track[]>([]);
+    const [playlistUrl, setPlaylistUrl] = useState<string | null>(null);
+    const [error, setError] = useState<string | null>(null);
 
-    console.log(`User has ${totalTracks} total saved tracks`);
+    useEffect(() => {
+        generateRecommendations();
+    }, []);
 
-    // ============================================
-    // STEP 3: GENERATE RANDOM POSITIONS TO SAMPLE FROM USER'S LIBRARY
-    // ============================================
-    // Generate 50 random positions within the user's total track count
-    // This ensures we get a diverse sample instead of just the most recent songs
-    const randomOffsets = [];
-    const itemsToGet = Math.min(50, totalTracks); // Don't exceed total tracks
-
-    for (let i = 0; i < itemsToGet; i++) {
-        const randomOffset = Math.floor(Math.random() * totalTracks);
-        randomOffsets.push(randomOffset);
-    }
-
-    // ============================================
-    // STEP 4: FETCH RANDOM TRACKS FROM USER'S LIBRARY
-    // ============================================
-    // Get tracks at those random positions to use as "seed" artists
-    const acquiredDataContainer = [];
-
-    for (const offset of randomOffsets) {
-        const response = await fetch(`https://api.spotify.com/v1/me/tracks?limit=1&offset=${offset}`, {
-            headers: {
-                'Authorization': `Bearer ${accessToken}`
-            }
-        });
+    const generateRecommendations = async () => {
+        setLoading(true);
+        setError(null);
         
-        const data = await response.json();
-        
-        if (data.items && data.items.length > 0) {
-            // Store track name and all artists from this random track
-            acquiredDataContainer.push({
-                name: data.items[0].track.name, 
-                artists: data.items[0].track.artists.map((artist: any) => artist.name)
-            });
-        }
-    }
-
-    console.log(`Got ${acquiredDataContainer.length} random tracks from ${totalTracks} total`);
-
-    // ============================================
-    // STEP 5: BUILD COMPLETE LIST OF USER'S ARTISTS (FOR FILTERING)
-    // ============================================
-    // Get ALL artists from user's entire library (not just the 50 random)
-    // This ensures we don't recommend artists the user already has saved
-    const userArtists = new Set();
-
-    // First get total tracks again  
-    let offset = 0;
-    const limit = 50;
-
-    while (offset < totalTracks) {
-        const allTracksResponse = await fetch(`https://api.spotify.com/v1/me/tracks?limit=${limit}&offset=${offset}`, {
-            headers: {
-                'Authorization': `Bearer ${accessToken}`
-            }
-        });
-        
-        const allTracksData = await allTracksResponse.json();
-        
-        if (allTracksData.items) {
-            for (const item of allTracksData.items) {
-                for (const artist of item.track.artists) {
-                    // Store in lowercase for case-insensitive comparison
-                    userArtists.add(artist.name.toLowerCase());
-                }
-            }
-        }
-        
-        offset += limit;
-    }
-
-    console.log(`User has ${userArtists.size} unique artists in their ENTIRE library`);
-
-    // ============================================
-    // STEP 6: GET SIMILAR ARTISTS FROM LAST.FM
-    // ============================================
-    // For each artist from our random tracks, find similar artists using Last.fm
-    // Keep requesting until we get exactly 10 unique artists the user doesn't already have
-    let similarArtists = [];
-    const targetArtists = 10;
-    const uniqueArtists = new Set();
-
-    for (const track of acquiredDataContainer) {
-        for (const artist of track.artists) {
-            // Stop if we already have enough unique artists
-            if (uniqueArtists.size >= targetArtists) break;
-            
-            // Call Last.fm API to get similar artists
-            const res = await fetch(
-                `http://ws.audioscrobbler.com/2.0/?method=artist.getsimilar&artist=${encodeURIComponent(artist)}&api_key=232c010f595b51b02591fbf00ec00d44&format=json`
-            );
-            const data = await res.json();
-            
-            if (data.similarartists?.artist) {
-                // Keep trying artists from this response until we get some new ones
-                for (const similarArtist of data.similarartists.artist) {
-                    const artistName = similarArtist.name;
-                    const artistLower = artistName.toLowerCase();
-                    
-                    // Skip if we already have this artist in our library, already added them, or they're blacklisted
-                    if (!userArtists.has(artistLower) && !uniqueArtists.has(artistLower) && !isArtistBlacklisted(artistName)) {
-                        uniqueArtists.add(artistLower);
-                        similarArtists.push(artistName);
-                        
-                        // Stop if we've found enough artists
-                        if (uniqueArtists.size >= targetArtists) break;
-                    }
-                }
-            }
-        }
-        // Break out of outer loop if we have enough artists
-        if (uniqueArtists.size >= targetArtists) break;
-    }
-
-    console.log(`Found ${uniqueArtists.size} unique new artists`);
-
-    // Load existing recommended songs and blacklisted artists
-    const existingRecommendations = loadRecommendedSongs();
-    const blacklistedArtists = loadBlacklistedArtists();
-    console.log(`Database contains ${existingRecommendations.length} previously recommended songs`);
-    console.log(`Database contains ${blacklistedArtists.length} blacklisted artists`);
-
-    // No need to shuffle since we're already getting exactly what we want
-    const randomTenArtists = similarArtists.slice(0, targetArtists);
-    
-    console.log('Random 10 similar artists:', randomTenArtists);
-
-    // ============================================
-    // STEP 7: SEARCH FOR ARTISTS ON SPOTIFY AND GET THEIR TOP TRACKS
-    // ============================================
-    // For each similar artist, find them on Spotify and get one of their top tracks
-    const foundTracks = [];
-    const targetTrackCount = 10;
-
-    // We might need more artists if some get skipped due to already recommended tracks
-    let artistIndex = 0;
-    
-    while (foundTracks.length < targetTrackCount && artistIndex < similarArtists.length) {
-        const artistName = similarArtists[artistIndex];
-        artistIndex++;
         try {
-            // Search for the artist on Spotify
-            const searchResponse = await fetch(`https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=1`, {
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`
-                }
-            });
-            
-            const searchData = await searchResponse.json();
-            
-            if (searchData.artists?.items?.[0]) {
-                const artist = searchData.artists.items[0];
-                
-                // Get the artist's top tracks
-                const tracksResponse = await fetch(`https://api.spotify.com/v1/artists/${artist.id}/top-tracks?market=US`, {
-                    headers: {
-                        'Authorization': `Bearer ${accessToken}`
-                    }
-                });
-                
-                const tracksData = await tracksResponse.json();
-                
-                if (tracksData.tracks && tracksData.tracks.length > 0) {
-                    // Try to find a track we haven't recommended before
-                    let selectedTrack = null;
-                    
-                    // First, try the top 5 tracks to find one we haven't recommended
-                    for (let i = 0; i < Math.min(5, tracksData.tracks.length); i++) {
-                        const track = tracksData.tracks[i];
-                        if (!isSongRecommended(track.uri)) {
-                            selectedTrack = track;
-                            break;
-                        }
-                    }
-                    
-                    // If we found a new track, use it
-                    if (selectedTrack) {
-                        // Store the track info for display and playlist creation
-                        const trackData = {
-                            artist: artistName,
-                            name: selectedTrack.name,
-                            preview_url: selectedTrack.preview_url,
-                            external_urls: selectedTrack.external_urls.spotify,
-                            uri: selectedTrack.uri // Needed for adding to playlist
-                        };
-                        
-                        foundTracks.push(trackData);
-                        
-                        // Add to our database so we don't recommend it again
-                        addRecommendedSong({
-                            uri: selectedTrack.uri,
-                            name: selectedTrack.name,
-                            artist: artistName,
-                            dateAdded: new Date().toISOString()
-                        });
-                        
-                        console.log(`Added new track: ${selectedTrack.name} by ${artistName}`);
-                    } else {
-                        console.log(`Skipping ${artistName} - all their top tracks already recommended`);
-                        // This artist's top tracks are all already recommended, skip them
-                        continue;
-                    }
-                }
-            }
-        } catch (error) {
-            console.log(`Error searching for ${artistName}:`, error);
-        }
-    }
-    
-    console.log(`Final result: Found ${foundTracks.length} new tracks from ${artistIndex} artists checked`);
-
-    // ============================================
-    // STEP 8: CREATE SPOTIFY PLAYLIST WITH ALL FOUND TRACKS
-    // ============================================
-    // Create a new private playlist and add all discovered tracks to it
-    let playlistUrl = null;
-
-    if (foundTracks.length > 0) {
-        try {
-            // Get user ID first (needed for playlist creation)
-            const userResponse = await fetch('https://api.spotify.com/v1/me', {
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`
-                }
-            });
-            const userData = await userResponse.json();
-            
-            // Create a new private playlist
-            const playlistResponse = await fetch(`https://api.spotify.com/v1/users/${userData.id}/playlists`, {
+            const response = await fetch('/api/generate-recommendations', {
                 method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    name: `Discover NOW ${new Date().toLocaleDateString()} ${new Date().toLocaleTimeString()}`,
-                    description: 'Generated playlist from similar artists',
-                    public: false
-                })
             });
             
-            const playlistData = await playlistResponse.json();
-
-            // Check if playlist creation was successful
-            if (playlistData.error) {
-                console.error('Playlist creation failed:', playlistData.error);
-                return;
-            }
-
-            console.log('Playlist data:', playlistData); // Debug log
-
-            // Get the playlist URL for the user to open
-            if (playlistData.external_urls?.spotify) {
-                playlistUrl = playlistData.external_urls.spotify;
+            const data = await response.json();
+            
+            if (data.success) {
+                setTracks(data.tracks);
+                setPlaylistUrl(data.playlistUrl);
             } else {
-                playlistUrl = `https://open.spotify.com/playlist/${playlistData.id}`;
+                setError(data.error || 'Failed to generate recommendations');
             }
-            
-            // Collect all track URIs for adding to playlist
-            const trackUris = [];
-            for (const track of foundTracks) {
-                if (track.uri) {
-                    trackUris.push(track.uri);
-                }
-            }
-            
-            // Add all tracks to the newly created playlist
-            if (trackUris.length > 0) {
-                await fetch(`https://api.spotify.com/v1/playlists/${playlistData.id}/tracks`, {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${accessToken}`,
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        uris: trackUris
-                    })
-                });
-            }
-            
-            console.log('Playlist created with', trackUris.length, 'tracks');
-            
-        } catch (error) {
-            console.error('Error creating playlist:', error);
+        } catch (err) {
+            setError('Error generating recommendations');
+            console.error('Error:', err);
+        } finally {
+            setLoading(false);
         }
+    };
+
+    if (loading) {
+        return (
+            <div className="min-h-screen flex items-center justify-center bg-gray-900">
+                <div className="text-center">
+                    <div className="animate-spin rounded-full h-16 w-16 border-b-2 border-green-500 mx-auto mb-4"></div>
+                    <h2 className="text-2xl font-bold text-white mb-2">Discovering Amazing Music...</h2>
+                    <p className="text-gray-400 mb-4">Please wait while we:</p>
+                    <ul className="text-gray-300 space-y-1">
+                        <li>📚 Analyze your music library</li>
+                        <li>🔍 Find similar artists on Last.fm</li>
+                        <li>🎵 Search Spotify for recommendations</li>
+                        <li>📝 Create your personalized playlist</li>
+                    </ul>
+                    <p className="text-gray-500 text-sm mt-4">This usually takes 30-60 seconds...</p>
+                </div>
+            </div>
+        );
     }
 
-    // ============================================
-    // STEP 9: RENDER THE RESULTS
-    // ============================================
-    // Display all found tracks with preview players and links
-    return (
-        <div className="p-8">
-            <h1 className="text-2xl mb-4">Recommended Tracks</h1>
-            {foundTracks.map((track, index) => (
-                <div key={index} className="mb-4 p-4 border rounded">
-                    <div className="flex justify-between items-start mb-2">
-                        <div>
-                            <h3 className="font-bold">{track.name}</h3>
-                            <p className="text-gray-600">by {track.artist}</p>
-                        </div>
-                        <BlacklistButton artistName={track.artist} />
-                    </div>
-                    <div className="mt-2">
-                        {/* Audio preview if available */}
-                        {track.preview_url && (
-                            <audio controls className="w-full">
-                                <source src={track.preview_url} type="audio/mpeg" />
-                            </audio>
-                        )}
-                        {/* Link to open song in Spotify */}
-                        <a 
-                            href={track.external_urls} 
-                            target="_blank" 
-                            className="inline-block mt-2 px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600"
-                        >
-                            Open in Spotify
-                        </a>
-                    </div>
-                </div>
-            ))}
-            {/* Link to open the generated playlist */}
-            {playlistUrl && (
-                <div className="mt-8 p-4 bg-green-100 rounded-lg">
-                    <h2 className="text-xl font-bold mb-2">Playlist Created!</h2>
-                    <a 
-                        href={playlistUrl} 
-                        target="_blank" 
+    if (error) {
+        return (
+            <div className="min-h-screen flex items-center justify-center bg-gray-900">
+                <div className="text-center">
+                    <h2 className="text-2xl font-bold text-red-500 mb-4">Oops! Something went wrong</h2>
+                    <p className="text-gray-300 mb-4">{error}</p>
+                    <button 
+                        onClick={generateRecommendations}
                         className="px-6 py-3 bg-green-500 text-white rounded-lg hover:bg-green-600"
                     >
-                        Open Playlist in Spotify ({foundTracks.length} songs)
-                    </a>
+                        Try Again
+                    </button>
                 </div>
-            )}
+            </div>
+        );
+    }
+
+    return (
+        <div className="p-8 bg-gray-900 min-h-screen">
+            <div className="max-w-4xl mx-auto">
+                <div className="mb-8 text-center">
+                    <h1 className="text-3xl font-bold text-white mb-4">🎵 Your Music Discoveries</h1>
+                    <p className="text-gray-300">Fresh recommendations based on your taste!</p>
+                    
+                    <button 
+                        onClick={generateRecommendations}
+                        className="mt-4 px-6 py-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600"
+                    >
+                        Generate New Recommendations
+                    </button>
+                </div>
+
+                {playlistUrl && (
+                    <div className="mb-8 p-4 bg-green-100 rounded-lg">
+                        <h2 className="text-xl font-bold text-green-800 mb-2">🎉 Playlist Created!</h2>
+                        <a 
+                            href={playlistUrl} 
+                            target="_blank" 
+                            rel="noopener noreferrer"
+                            className="px-6 py-3 bg-green-500 text-white rounded-lg hover:bg-green-600 inline-block"
+                        >
+                            Open Playlist in Spotify ({tracks.length} songs)
+                        </a>
+                    </div>
+                )}
+
+                <div className="space-y-6">
+                    {tracks.map((track, index) => (
+                        <div key={index} className="bg-gray-800 rounded-lg p-6 shadow-lg">
+                            <div className="flex justify-between items-start mb-4">
+                                <div>
+                                    <h3 className="text-xl font-bold text-white">{track.name}</h3>
+                                    <p className="text-gray-400">by {track.artist}</p>
+                                </div>
+                                <BlacklistButton artistName={track.artist} />
+                            </div>
+                            
+                            <div className="space-y-3">
+                                {track.preview_url && (
+                                    <audio controls className="w-full">
+                                        <source src={track.preview_url} type="audio/mpeg" />
+                                        Your browser does not support the audio element.
+                                    </audio>
+                                )}
+                                
+                                <a 
+                                    href={track.external_urls} 
+                                    target="_blank" 
+                                    rel="noopener noreferrer"
+                                    className="inline-block px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600 transition-colors"
+                                >
+                                    🎧 Open in Spotify
+                                </a>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+
+                {tracks.length === 0 && !loading && (
+                    <div className="text-center text-gray-400 mt-8">
+                        <p>No recommendations found. Try generating new ones!</p>
+                    </div>
+                )}
+            </div>
         </div>
     );
 }

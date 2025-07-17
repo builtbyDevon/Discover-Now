@@ -46,7 +46,7 @@ export default function BlacklistButton({ artistName }: BlacklistButtonProps) {
                     : 'bg-red-500 hover:bg-red-600 text-white'
             }`}
         >
-            {isBlacklisting ? '...' : isBlacklisted ? 'Blacklisted' : '🚫 Don\'t Recommend'}
+            {isBlacklisting ? '...' : isBlacklisted ? 'Blacklisted' : '🚫 Don\'t Recommend this Artist'}
         </button>
     );
 } 
