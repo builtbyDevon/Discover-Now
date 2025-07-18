@@ -2,6 +2,10 @@ import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 import { loadRecommendedSongs, addRecommendedSong, isSongRecommended, isArtistBlacklisted, loadBlacklistedArtists, hasArtistReachedLimit } from '@/lib/songDatabase';
 
+// Token caching to prevent spam refresh calls
+let cachedToken: { token: string; expiresAt: number } | null = null;
+let refreshPromise: Promise<{ token: string; refreshed: boolean } | null> | null = null;
+
 // Helper function to check if token needs refresh and get a valid access token
 async function getValidAccessToken(): Promise<{ token: string; refreshed: boolean } | null> {
     const cookieStore = await cookies();
@@ -13,40 +17,68 @@ async function getValidAccessToken(): Promise<{ token: string; refreshed: boolea
         return null;
     }
 
-    // Check if token is expired (with 5 minute buffer)
     const expiresAt = parseInt(expiresAtStr || '0');
     const fiveMinutesFromNow = Date.now() + (5 * 60 * 1000);
     
+    // Use cached token if available and still valid
+    if (cachedToken && cachedToken.expiresAt > Date.now()) {
+        return { token: cachedToken.token, refreshed: false };
+    }
+    
+    // If token is still valid, cache it and return
     if (expiresAt > fiveMinutesFromNow) {
-        // Token is still valid
+        cachedToken = { token: accessToken, expiresAt: expiresAt };
         return { token: accessToken, refreshed: false };
     }
 
-    // Token is expired or about to expire, try to refresh
+    // Token needs refresh - check if refresh is already in progress
+    if (refreshPromise) {
+        // Wait for the existing refresh to complete
+        return await refreshPromise;
+    }
+
+    // No refresh token available
     if (!refreshToken) {
-        return null; // No refresh token available
+        return null;
     }
 
-    try {
-        const response = await fetch('http://127.0.0.1:3000/api/auth/refresh', {
-            method: 'POST',
-            headers: {
-                'Cookie': `spotify_refresh_token=${refreshToken}`
+    // Start refresh process (only one at a time)
+    refreshPromise = (async () => {
+        try {
+            const response = await fetch('http://127.0.0.1:3000/api/auth/refresh', {
+                method: 'POST',
+                headers: {
+                    'Cookie': `spotify_refresh_token=${refreshToken}`
+                }
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                
+                // Cache the new token for 55 minutes (tokens last 1 hour)
+                cachedToken = { 
+                    token: data.access_token, 
+                    expiresAt: Date.now() + (55 * 60 * 1000) 
+                };
+                
+                return { token: data.access_token, refreshed: true };
+            } else {
+                // Refresh failed, return current token
+                return { token: accessToken, refreshed: false };
             }
-        });
-
-        if (response.ok) {
-            const data = await response.json();
-            return { token: data.access_token, refreshed: true };
+        } catch (error) {
+            console.error('Error refreshing token:', error);
+            return { token: accessToken, refreshed: false };
+        } finally {
+            // Clear the refresh promise so future calls can try again
+            refreshPromise = null;
         }
-    } catch (error) {
-        console.error('Error refreshing token:', error);
-    }
+    })();
 
-    return null; // Refresh failed
+    return await refreshPromise;
 }
 
-// Helper function to make authenticated Spotify API requests with auto-refresh
+// Helper function to make authenticated Spotify API requests
 async function makeSpotifyRequest(url: string, options: RequestInit = {}): Promise<Response> {
     const tokenInfo = await getValidAccessToken();
     
@@ -59,28 +91,10 @@ async function makeSpotifyRequest(url: string, options: RequestInit = {}): Promi
         ...options.headers
     };
 
-    const response = await fetch(url, {
+    return fetch(url, {
         ...options,
         headers
     });
-
-    // If we get a 401 and haven't already refreshed, try once more with refresh
-    if (response.status === 401 && !tokenInfo.refreshed) {
-        const newTokenInfo = await getValidAccessToken();
-        if (newTokenInfo && newTokenInfo.refreshed) {
-            const retryHeaders = {
-                'Authorization': `Bearer ${newTokenInfo.token}`,
-                ...options.headers
-            };
-            
-            return fetch(url, {
-                ...options,
-                headers: retryHeaders
-            });
-        }
-    }
-
-    return response;
 }
 
 // Simple string similarity function (Levenshtein distance based)
@@ -367,6 +381,11 @@ export async function POST(request: NextRequest) {
         let attemptsCount = 0;
         const maxAttempts = 100; // Prevent infinite loops
         
+        // Quality tracking
+        let popularTracksCount = 0;
+        let backupTracksCount = 0;
+        const minPopularity = 45;
+        
         console.log(`Starting search for ${targetTrackCount} tracks from ${similarArtists.length} similar artists`);
         
         while (foundTracks.length < targetTrackCount && artistIndex < similarArtists.length && attemptsCount < maxAttempts) {
@@ -419,12 +438,44 @@ export async function POST(request: NextRequest) {
                         
                         if (tracksData.tracks && tracksData.tracks.length > 0) {
                             let selectedTrack = null;
+                            const minPopularity = 45; // Minimum popularity score (0-100) for quality filtering
                             
-                            for (let i = 0; i < Math.min(5, tracksData.tracks.length); i++) {
+                            // First pass: Try to find a popular track (45+ popularity)
+                            for (let i = 0; i < Math.min(10, tracksData.tracks.length); i++) {
                                 const track = tracksData.tracks[i];
-                                if (!isSongRecommended(track.uri)) {
+                                const popularity = track.popularity || 0;
+                                
+                                if (!isSongRecommended(track.uri) && popularity >= minPopularity) {
                                     selectedTrack = track;
+                                    popularTracksCount++;
+                                    console.log(`🔥 Selected popular track: "${track.name}" (popularity: ${popularity}/100)`);
                                     break;
+                                }
+                            }
+                            
+                            // Second pass: If no popular tracks found, pick the MOST popular unrecommended track
+                            if (!selectedTrack) {
+                                console.log(`⚠️ No popular tracks (${minPopularity}+) found for ${bestMatch.name}, finding most popular available track...`);
+                                
+                                // Finds the HIGHEST popularity among unrecommended tracks
+                                let bestBackupTrack = null;
+                                let bestBackupPopularity = -1;
+
+                                // Compares all tracks to find the most popular one
+                                for (let i = 0; i < Math.min(10, tracksData.tracks.length); i++) {
+                                    const track = tracksData.tracks[i];
+                                    const popularity = track.popularity || 0;
+                                    
+                                    if (!isSongRecommended(track.uri) && popularity > bestBackupPopularity) {
+                                        bestBackupTrack = track;
+                                        bestBackupPopularity = popularity;
+                                    }
+                                }
+                                
+                                if (bestBackupTrack) {
+                                    selectedTrack = bestBackupTrack;
+                                    backupTracksCount++;
+                                    console.log(`📊 Selected most popular backup: "${bestBackupTrack.name}" (popularity: ${bestBackupPopularity}/100)`);
                                 }
                             }
                             
@@ -475,6 +526,12 @@ export async function POST(request: NextRequest) {
         }
 
         console.log(`🎵 Final result: Found ${foundTracks.length} tracks after ${attemptsCount} attempts`);
+        console.log(`🔥 Quality breakdown: ${popularTracksCount} popular tracks (${minPopularity}+ popularity), ${backupTracksCount} backup tracks`);
+        
+        if (popularTracksCount > 0) {
+            const popularPercentage = ((popularTracksCount / foundTracks.length) * 100).toFixed(0);
+            console.log(`✨ ${popularPercentage}% of tracks meet the quality threshold - these should be bangers!`);
+        }
 
         // ============================================
         // STEP 7: CREATE SPOTIFY PLAYLIST
@@ -530,7 +587,13 @@ export async function POST(request: NextRequest) {
             tracks: foundTracks,
             playlistUrl,
             totalTracks,
-            message: 'Recommendations generated successfully'
+            qualityStats: {
+                popularTracks: popularTracksCount,
+                backupTracks: backupTracksCount,
+                popularityThreshold: minPopularity,
+                qualityPercentage: foundTracks.length > 0 ? Math.round((popularTracksCount / foundTracks.length) * 100) : 0
+            },
+            message: `Recommendations generated with ${popularTracksCount}/${foundTracks.length} high-quality tracks (${minPopularity}+ popularity)`
         });
 
     } catch (error) {
