@@ -12,9 +12,10 @@ export async function GET(request: NextRequest) {
     // Getting url of site dynamically
     const redirect_uri = 'http://127.0.0.1:3000/api/auth/callback';
 
-    if (state === null) {
-        status = 'State Error';
+    if (state === null || code === null) {
+        status = 'State or Code Error';
         console.log(status);
+        return NextResponse.redirect(new URL('/?error=invalid_request', 'http://127.0.0.1:3000'));
       } else {
 
         const tokenResponse = await fetch('https://accounts.spotify.com/api/token', {
@@ -39,12 +40,35 @@ export async function GET(request: NextRequest) {
         }
 
         const response = NextResponse.redirect(new URL('/dashboard', 'http://127.0.0.1:3000'));
+        
+        // Set access token cookie with longer expiration (7 days)
         response.cookies.set('spotify_access_token', tokenData.access_token, {
             httpOnly: true,
             // secure: process.env.NODE_ENV === 'production',
-            path: '/', // Add this
+            path: '/',
             sameSite: 'lax',
-            maxAge: tokenData.expires_in
+            maxAge: 7 * 24 * 60 * 60 // 7 days instead of 1 hour
+        });
+
+        // Store refresh token if available (for auto-refresh functionality)
+        if (tokenData.refresh_token) {
+            response.cookies.set('spotify_refresh_token', tokenData.refresh_token, {
+                httpOnly: true,
+                // secure: process.env.NODE_ENV === 'production',
+                path: '/',
+                sameSite: 'lax',
+                maxAge: 7 * 24 * 60 * 60 // 7 days
+            });
+        }
+
+        // Store when the access token actually expires for refresh logic
+        const expiresAt = Date.now() + (tokenData.expires_in * 1000);
+        response.cookies.set('spotify_token_expires_at', expiresAt.toString(), {
+            httpOnly: true,
+            // secure: process.env.NODE_ENV === 'production',
+            path: '/',
+            sameSite: 'lax',
+            maxAge: 7 * 24 * 60 * 60 // 7 days
         });
 
         return response;
