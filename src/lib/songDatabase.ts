@@ -75,6 +75,12 @@ export function getRecommendedSongsForArtist(artistName: string): RecommendedSon
     return songs.filter(song => song.artist.toLowerCase() === artistName.toLowerCase());
 }
 
+// Check if an artist has reached the recommendation limit (default 3 songs)
+export function hasArtistReachedLimit(artistName: string, limit: number = 3): boolean {
+    const artistSongs = getRecommendedSongsForArtist(artistName);
+    return artistSongs.length >= limit;
+}
+
 // ============================================
 // BLACKLIST FUNCTIONS
 // ============================================

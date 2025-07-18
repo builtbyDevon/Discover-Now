@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
-import { loadRecommendedSongs, addRecommendedSong, isSongRecommended, isArtistBlacklisted, loadBlacklistedArtists } from '@/lib/songDatabase';
+import { loadRecommendedSongs, addRecommendedSong, isSongRecommended, isArtistBlacklisted, loadBlacklistedArtists, hasArtistReachedLimit } from '@/lib/songDatabase';
 
 // Helper function to check if token needs refresh and get a valid access token
 async function getValidAccessToken(): Promise<{ token: string; refreshed: boolean } | null> {
@@ -304,6 +304,7 @@ export async function POST(request: NextRequest) {
         }
 
         console.log(`User has ${userArtists.size} unique artists in their library (for filtering)`);
+        console.log(`Will also filter out artists that have already contributed 3+ songs (shown individually below)`);
 
         // ============================================
         // STEP 5: GET SIMILAR ARTISTS FROM LAST.FM
@@ -335,13 +336,15 @@ export async function POST(request: NextRequest) {
                         
                         const isArtistInLibrary = userArtists.has(artistLower) || userArtists.has(baseArtistName);
                         
-                        if (!isArtistInLibrary && !uniqueArtists.has(artistLower) && !isArtistBlacklisted(artistName)) {
+                        if (!isArtistInLibrary && !uniqueArtists.has(artistLower) && !isArtistBlacklisted(artistName) && !hasArtistReachedLimit(artistName)) {
                             console.log(`✅ Adding similar artist: ${artistName} (not in your ${userArtists.size} library artists)`);
                         } else if (isArtistInLibrary) {
                             console.log(`❌ Skipping ${artistName} - already in your library`);
+                        } else if (hasArtistReachedLimit(artistName)) {
+                            console.log(`⏭️ Skipping ${artistName} - already recommended 3+ songs from this artist`);
                         }
                         
-                        if (!isArtistInLibrary && !uniqueArtists.has(artistLower) && !isArtistBlacklisted(artistName)) {
+                        if (!isArtistInLibrary && !uniqueArtists.has(artistLower) && !isArtistBlacklisted(artistName) && !hasArtistReachedLimit(artistName)) {
                             uniqueArtists.add(artistLower);
                             similarArtists.push(artistName);
                             
